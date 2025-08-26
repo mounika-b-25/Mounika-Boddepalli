@@ -1,1 +1,910 @@
+import gradio as gr
+import httpx
+import tempfile
+import urllib3
+import os
+import re
+import json
+import time
+import random
+import asyncio
+import warnings
+import hashlib
+from collections import deque, defaultdict
+from decimal import Decimal, InvalidOperation
+
+# --- quiet logs/warnings ---
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+API_KEY = "test:P3NiOR7tC6oI7PJtdtSx"
+API_URLS = {
+    "medical":  "https://testmedicalritepro.cpii.com/api/bom",
+    "satcom":   "https://testsatcomritepro.cpii.com/api/bom",
+    "emetapart":"https://testemetapartritepro.cpii.com/api/bom"
+}
+# Force no-cache semantics in every request
+HEADERS = {
+    "X-RitePro-Auth": API_KEY,
+    "Accept": "application/json",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
+}
+
+DEBUG = False
+_LAST_API_URL = None
+
+# ======== Performance knobs per API (deep crawl for ALL) ========
+def _pick_limits_for(api_url: str):
+    if "satcom" in api_url:
+        return 24, 15
+    if "medical" in api_url:
+        return 10, 8
+    if "emetapart" in api_url:
+        return 16, 10
+    return 20, 12
+
+HTTP_TIMEOUTS = httpx.Timeout(connect=8.0, read=25.0, write=20.0, pool=60.0)
+HTTP_LIMITS   = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+
+RETRY_MAX      = 3
+RETRY_BACKOFF  = 0.5
+RETRY_JITTER   = (0.05, 0.25)
+
+# —— disable disk caches for correctness ——
+DISABLE_ALL_CACHES = True
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "bombridge_cache_v2")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# ======== Crawl rails (deep for all; budgets prevent hangs) ========
+CRAWL_MAX_DEPTH      = 20       # deep multilevel
+WALL_CLOCK_BUDGET    = 480      # seconds
+MAX_NODES_BUDGET     = 20000    # parent nodes visited
+
+# ---------- global indices ----------
+_EDGE_PARENTS_NORM = defaultdict(set)
+_EDGE_PARENTS_DIG  = defaultdict(set)
+_EDGE_PARENTS_NOZ  = defaultdict(set)
+_EDGE_PARENTS_PAD  = defaultdict(set)
+
+_LAST_CHILD_QTY  = {}   # child_variant -> last qty str
+_LAST_CHILD_DESC = {}   # child_variant -> last desc str
+_EDGE_QTY        = {}   # (parent_variant, child_variant) -> last qty str
+
+# in-run children rows (live) and edges
+_RUN_CHILDREN = {}   # parent_norm -> [rows as returned by API]
+_LIVE_EDGES   = set()  # (parent_norm, child_norm)
+
+# ---------- helpers ----------
+def clean(val):
+    return val.strip() if isinstance(val, str) else val or ""
+
+def normalize_id(val):
+    if val is None:
+        return ""
+    s = str(val).strip()
+    s = re.sub(r"\s+", "", s)
+    return s.upper()
+
+def digits_only(s: str) -> str:
+    return re.sub(r"\D", "", str(s)) if s is not None else ""
+
+def key_nozeros(s: str) -> str:
+    d = digits_only(s)
+    d = re.sub(r"^0+", "", d)
+    return d or "0"
+
+def key_pad10(s: str) -> str:
+    d = digits_only(s)
+    return d.zfill(10)
+
+def key_variants(s: str):
+    v_norm = normalize_id(s)
+    v_dig  = digits_only(s)
+    v_noz  = key_nozeros(s)
+    v_pad  = key_pad10(s)
+    seen, out = set(), []
+    for v in (v_norm, v_dig, v_noz, v_pad):
+        if v and v not in seen:
+            out.append(v); seen.add(v)
+    return out
+
+def safe_tag(text: str) -> str:
+    t = str(text).strip()
+    t = re.sub(r'[\\/:*?"<>|]+', '', t).replace(" ", "")
+    return t or "CONFIG"
+
+def qty_normalize(s: str) -> str:
+    if s is None: return ""
+    return str(s).strip()
+
+def _to_decimal(q):
+    if q is None: return None
+    s = str(q).strip()
+    if s == "": return None
+    s = s.replace(",", "")
+    try: return Decimal(s)
+    except InvalidOperation:
+        try: return Decimal(str(float(s)))
+        except Exception: return None
+
+def qty_equal(q1, q2, tol=Decimal("0.0005")):
+    s1 = str(q1).strip() if q1 is not None else ""
+    s2 = str(q2).strip() if q2 is not None else ""
+    if s1.upper() == "AR": s1 = "0"
+    if s2.upper() == "AR": s2 = "0"
+    d1, d2 = _to_decimal(s1), _to_decimal(s2)
+    if d1 is None and d2 is None: return ""
+    if d1 is None or d2 is None:  return "No"
+    return "Yes" if (d1 - d2).copy_abs() <= tol else "No"
+
+# ---------- Disk cache helpers (hard OFF) ----------
+def _cache_get(api_url: str, parent_name: str):
+    return None
+
+def _cache_set(api_url: str, parent_name: str, data):
+    return
+
+# ---------- Rate limiter ----------
+class RateLimiter:
+    def __init__(self, rps: float):
+        self.rps = max(0.1, float(rps))
+        self.min_interval = 1.0 / self.rps
+        self._last = 0.0
+    async def wait(self):
+        now = time.perf_counter()
+        delta = now - self._last
+        if delta < self.min_interval:
+            await asyncio.sleep(self.min_interval - delta)
+        self._last = time.perf_counter()
+
+# ---------- HTTP query candidates ----------
+def _query_candidates_for_api(api_url: str, raw: str):
+    """
+    Build the set of HTTP query candidates.
+    - SATCOM: raw, UPPER, and if numeric -> 10-digit padded
+    - Others: raw, UPPER only
+    """
+    cands = {raw, normalize_id(raw)}
+    if "satcom" in api_url:
+        d = digits_only(raw)
+        if d:
+            cands.add(key_pad10(raw))
+    return {c for c in cands if c}
+
+# ---------- async fetch (LIVE only) ----------
+async def _fetch_one_parent(client: httpx.AsyncClient, api_url: str, parent: str, limiter: RateLimiter):
+    raw = clean(parent)
+    for val in _query_candidates_for_api(api_url, raw):
+        key_norm = normalize_id(val)
+        if key_norm in _RUN_CHILDREN:
+            return _RUN_CHILDREN[key_norm], val
+
+        data = []
+        for attempt in range(RETRY_MAX):
+            try:
+                await limiter.wait()
+                params = {"parentName": val, "_nc": f"{time.time():.6f}-{random.randint(1000,9999)}"}
+                r = await client.get(api_url, headers=HEADERS, params=params)
+                if r.status_code in (429, 503):
+                    back = RETRY_BACKOFF * (2 ** attempt) + random.uniform(*RETRY_JITTER)
+                    await asyncio.sleep(back); continue
+                r.raise_for_status()
+                data = r.json() or []
+                break
+            except Exception:
+                back = RETRY_BACKOFF * (2 ** attempt) + random.uniform(*RETRY_JITTER)
+                await asyncio.sleep(back)
+
+        _RUN_CHILDREN[key_norm] = data
+        for it in data:
+            ch = it.get("child", {}) or {}
+            cid = clean(ch.get("item_id"))
+            if cid:
+                _LIVE_EDGES.add((key_norm, normalize_id(cid)))
+
+        if data:
+            return data, val
+
+    _RUN_CHILDREN[normalize_id(raw)] = []
+    return [], raw
+
+# ======== Deep BFS crawl with budgets (populate in-run cache) ========
+async def _crawl_all_async(api_url: str, root_model: str):
+    _RUN_CHILDREN.clear()
+    _LIVE_EDGES.clear()
+
+    max_conc, rps = _pick_limits_for(api_url)
+    limiter = RateLimiter(rps)
+
+    seen = set()
+    queue = deque()
+    start = time.perf_counter()
+    nodes_seen = 0
+
+    async with httpx.AsyncClient(http2=False, verify=False,
+                                 timeout=HTTP_TIMEOUTS, limits=HTTP_LIMITS) as client:
+        data0, effective_root = await _fetch_one_parent(client, api_url, clean(root_model), limiter)
+        root_norm = normalize_id(effective_root)
+        seen.add(root_norm)
+
+        for it in data0:
+            ch = it.get("child", {}) or {}
+            cid = clean(ch.get("item_id"))
+            if not cid or cid == "None":
+                continue
+            nid = normalize_id(cid)
+            if nid not in seen:
+                seen.add(nid)
+                queue.append((cid, 1))
+
+        sem = asyncio.Semaphore(max_conc)
+
+        async def worker():
+            nonlocal nodes_seen
+            while True:
+                if (time.perf_counter() - start) > WALL_CLOCK_BUDGET: return
+                if nodes_seen >= MAX_NODES_BUDGET: return
+                try:
+                    pid, depth = queue.popleft()
+                except IndexError:
+                    return
+                async with sem:
+                    rows, _ = await _fetch_one_parent(client, api_url, pid, limiter)
+                    nodes_seen += 1
+                if depth < CRAWL_MAX_DEPTH:
+                    for it in rows:
+                        ch = it.get("child", {}) or {}
+                        cid = clean(ch.get("item_id"))
+                        if not cid or cid == "None":
+                            continue
+                        nid = normalize_id(cid)
+                        if nid not in seen:
+                            seen.add(nid)
+                            queue.append((cid, depth + 1))
+
+        tasks = [asyncio.create_task(worker()) for _ in range(max_conc)]
+        await asyncio.gather(*tasks)
+
+    return effective_root, _RUN_CHILDREN[root_norm]
+
+def _run_async(coro):
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            try: loop.close()
+            except Exception: pass
+
+def get_children_cached_sync(api_url, parent_id: str):
+    """LIVE results captured this run; fetch live if not present."""
+    key = normalize_id(parent_id)
+    if key in _RUN_CHILDREN:
+        return _RUN_CHILDREN[key]
+
+    async def _one():
+        async with httpx.AsyncClient(http2=False, verify=False,
+                                     timeout=HTTP_TIMEOUTS, limits=HTTP_LIMITS) as client:
+            max_conc, rps = _pick_limits_for(api_url)
+            limiter = RateLimiter(rps)
+            data, _ = await _fetch_one_parent(client, api_url, parent_id, limiter)
+            return data
+    data = _run_async(_one())
+    _RUN_CHILDREN[key] = data
+    return data
+
+# ---------- API crawl (build indices; NO row dedupe; per-path expansion) ----------
+def fetch_bom_all_levels(api_url, root_model):
+    global _EDGE_PARENTS_NORM, _EDGE_PARENTS_DIG, _EDGE_PARENTS_NOZ, _EDGE_PARENTS_PAD
+    global _LAST_CHILD_QTY, _LAST_CHILD_DESC, _EDGE_QTY
+
+    _EDGE_PARENTS_NORM = defaultdict(set)
+    _EDGE_PARENTS_DIG  = defaultdict(set)
+    _EDGE_PARENTS_NOZ  = defaultdict(set)
+    _EDGE_PARENTS_PAD  = defaultdict(set)
+    _LAST_CHILD_QTY    = {}
+    _LAST_CHILD_DESC   = {}
+    _EDGE_QTY          = {}
+
+    effective_root, data0 = _run_async(_crawl_all_async(api_url, root_model))
+
+    results = []
+    # always include root row
+    results.append({"Level": 0, "Item ID": effective_root, "Description": "", "Qty": ""})
+
+    # per-path expansion (counts repeated subassemblies)
+    parent_queue = deque([(effective_root, 0, data0, set())])
+
+    while parent_queue:
+        parent_id, level, preloaded_children, ancestors = parent_queue.popleft()
+        parent_orig = clean(parent_id)
+        parent_norm = normalize_id(parent_orig)
+
+        data = preloaded_children if level == 0 else get_children_cached_sync(api_url, parent_orig)
+
+        for it in data:
+            child = it.get("child", {}) or {}
+            cid = clean(child.get("item_id"))
+            if not cid or cid == "None":
+                continue
+
+            desc = clean(child.get("description"))
+            qty_raw = clean(it.get("qty"))
+            qty = qty_normalize(qty_raw) if qty_raw not in ("", None, "None") else ""
+
+            cid_vars = key_variants(cid)
+
+            if parent_norm:
+                for ck in cid_vars:
+                    _EDGE_QTY[(parent_norm, ck)] = str(qty)
+
+            for v in cid_vars:
+                if desc:
+                    _LAST_CHILD_DESC[v] = desc
+                if qty:
+                    _LAST_CHILD_QTY[v] = str(qty)
+
+            for v in cid_vars:
+                _EDGE_PARENTS_NORM[normalize_id(v)].add(parent_orig)
+                _EDGE_PARENTS_DIG[digits_only(v)].add(parent_orig)
+                _EDGE_PARENTS_NOZ[key_nozeros(v)].add(parent_orig)
+                _EDGE_PARENTS_PAD[key_pad10(v)].add(parent_orig)
+
+            results.append({"Level": level + 1, "Item ID": cid, "Description": desc, "Qty": qty})
+
+            nid = normalize_id(cid)
+            # per-path cycle guard
+            if (level + 1) < CRAWL_MAX_DEPTH and nid not in ancestors:
+                parent_queue.append((cid, level + 1, None, ancestors | {parent_norm}))
+
+    return results
+
+# ---------- load JDE ----------
+def _read_first_valid_sheet(xlsx_path_or_buf):
+    import pandas as pd
+    xl = pd.ExcelFile(xlsx_path_or_buf)
+    needed = {"2nd Item Number", "Quantity", "Level"}
+    for sh in xl.sheet_names:
+        df = xl.parse(sh); df.columns = [str(c).strip() for c in df.columns]
+        if needed.issubset(set(df.columns)):
+            return df
+    df = xl.parse(xl.sheet_names[0]); df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+def load_jde_excel(jde_file):
+    import pandas as pd
+    try:
+        return _read_first_valid_sheet(jde_file.name)
+    except Exception:
+        return pd.DataFrame()
+
+# ---------- JDE maps ----------
+def build_jde_maps(jde_df):
+    jde_df = jde_df.copy()
+    jde_df.rename(columns=lambda x: str(x).strip(), inplace=True)
+
+    if "2nd Item Number" not in jde_df.columns and "Item Number" in jde_df.columns:
+        jde_df["2nd Item Number"] = jde_df["Item Number"].astype(str)
+    if "Stocking Type" not in jde_df.columns and "Stkg Typ" in jde_df.columns:
+        jde_df["Stocking Type"] = jde_df["Stkg Typ"].astype(str)
+    if "Level" not in jde_df.columns:
+        jde_df["Level"] = ""
+    if "Description" not in jde_df.columns:
+        jde_df["Description"] = ""
+
+    jde_df["2nd Item Number"] = jde_df["2nd Item Number"].astype(str).str.strip()
+    jde_df["Quantity"]        = jde_df["Quantity"].astype(str).str.strip()
+    jde_df["Level"]           = jde_df["Level"].astype(str).str.strip()
+    jde_df["Stocking Type"]   = jde_df["Stocking Type"].astype(str).str.strip()
+    jde_df["Description"]     = jde_df["Description"].astype(str).str.strip()
+
+    jde_canon_map = {}
+    jde_stock_map = {}
+    jde_qty_lists = defaultdict(list)
+    jde_desc_map  = {}
+
+    for _, row in jde_df.iterrows():
+        raw_id = str(row.get("2nd Item Number", "")).strip()
+        if raw_id == "":
+            continue
+        canonical = raw_id
+        st  = str(row.get("Stocking Type", "")).strip().upper() or "MISSING"
+        qty = str(row.get("Quantity", "")).strip()
+        dsc = str(row.get("Description", "")).strip()
+
+        for v in key_variants(raw_id):
+            if v not in jde_canon_map:
+                jde_canon_map[v] = canonical
+            if v not in jde_stock_map:
+                jde_stock_map[v] = st
+            if dsc and v not in jde_desc_map:
+                jde_desc_map[v] = dsc
+            if qty != "":
+                jde_qty_lists[v].append(qty)
+
+    return jde_canon_map, jde_stock_map, jde_qty_lists, jde_desc_map
+
+def lookup_variant(m: dict, item_id: str, default=""):
+    for v in key_variants(item_id):
+        if v in m:
+            return m[v]
+    return default
+
+# ---------- pipeline ----------
+def extract_bom(api_src, model_number):
+    import pandas as pd
+    global _LAST_API_URL
+    if not str(model_number).strip():
+        return "❌ Please enter a model number.", None, None, None
+
+    api_url = API_URLS.get(api_src)
+    if not api_url:
+        return "❌ Invalid API source.", None, None, None
+
+    _LAST_API_URL = api_url
+    all_rows = fetch_bom_all_levels(api_url, model_number)
+    df = pd.DataFrame(all_rows).fillna("")
+    config_tag = safe_tag(model_number)
+    tmp_file = os.path.join(tempfile.gettempdir(), f"{config_tag}BOM_Data_Export.xlsx")
+    df.to_excel(tmp_file, index=False)
+
+    # UI preview
+    df_preview = df.head(200)
+    return f"✅ {len(df)} total rows fetched", df_preview, tmp_file, model_number
+
+def compare_and_generate_excel(api_df, jde_df, config_tag, root_model):
+    import pandas as pd
+    final_path_multi  = os.path.join(tempfile.gettempdir(), f"{config_tag}BOMBridge_results.xlsx")
+    final_path_single = os.path.join(tempfile.gettempdir(), f"{config_tag}BOMBridge_single_level.xlsx")
+    try:
+        jde_canon_map, jde_stock_map, jde_qty_lists, jde_desc_map = build_jde_maps(jde_df)
+
+        api_df = api_df.rename(columns=lambda x: str(x).strip()).copy()
+        for col in ("Item ID", "Qty", "Level"):
+            if col in api_df.columns:
+                api_df[col] = api_df[col].astype(str).str.strip()
+        if "Description" not in api_df.columns:
+            api_df["Description"] = ""
+
+        api_df["_nid"] = api_df["Item ID"].apply(normalize_id)
+        map_item_exact = api_df.drop_duplicates("_nid").set_index("_nid")["Item ID"].to_dict()
+
+        rp_level_map = {}
+        for _, r in api_df.iterrows():
+            try:
+                lvl = int(float(str(r.get("Level","")).strip() or "0"))
+            except Exception:
+                lvl = 0
+            rp_key = normalize_id(r.get("Item ID",""))
+            rp_level_map[rp_key] = lvl
+
+        jde_df = jde_df.copy()
+        jde_df.rename(columns=lambda x: str(x).strip(), inplace=True)
+        if "2nd Item Number" not in jde_df.columns and "Item Number" in jde_df.columns:
+            jde_df["2nd Item Number"] = jde_df["Item Number"].astype(str)
+        for col in ("2nd Item Number", "Quantity", "Level"):
+            if col in jde_df.columns:
+                jde_df[col] = jde_df[col].astype(str).str.strip()
+        if "Stocking Type" not in jde_df.columns:
+            jde_df["Stocking Type"] = ""
+        if "Description" not in jde_df.columns:
+            jde_df["Description"] = ""
+
+        out = jde_df.copy()
+        out["normalized_id"] = out["2nd Item Number"].apply(normalize_id)
+        out["JDE Item ID"]  = out["2nd Item Number"]
+        out["JDE Quantity"] = out["Quantity"]
+        out["Item ID"]      = out["normalized_id"].map(map_item_exact).fillna(out["JDE Item ID"]).fillna("")
+
+        def parents_for(candidate: str):
+            if candidate == "": return set()
+            keys = key_variants(candidate)
+            res = set()
+            for k in keys:
+                res |= _EDGE_PARENTS_NORM.get(normalize_id(k), set())
+                res |= _EDGE_PARENTS_DIG.get(digits_only(k), set())
+                res |= _EDGE_PARENTS_NOZ.get(key_nozeros(k), set())
+                res |= _EDGE_PARENTS_PAD.get(key_pad10(k), set())
+            return res
+
+        def resolve_parent(item_id, jde_id, lvl):
+            p = parents_for(item_id)
+            if len(p) > 0: return sorted(p)[0]
+            p2 = parents_for(jde_id)
+            if len(p2) > 0: return sorted(p2)[0]
+            try:
+                is_level1 = str(lvl).strip() in {"1", "1.0"}
+            except Exception:
+                is_level1 = False
+            return root_model if is_level1 else "missing"
+
+        out["Parent Item ID"] = [resolve_parent(out.at[i,"Item ID"], out.at[i,"JDE Item ID"], out.at[i,"Level"])
+                                 for i in out.index]
+
+        def get_st(item_id):
+            return lookup_variant(jde_stock_map, item_id, default="missing")
+
+        out["Parent Stocking Type"] = out["Parent Item ID"].apply(lambda pid: get_st(pid))
+        out["Stocking Type"]        = out["2nd Item Number"].apply(lambda x: get_st(x))
+
+        def desc_for(item, prev):
+            jde_d = lookup_variant(jde_desc_map, item, default="")
+            if jde_d: return jde_d
+            d = ""
+            for v in key_variants(item):
+                if v in _LAST_CHILD_DESC:
+                    d = _LAST_CHILD_DESC[v]
+            return d or prev
+
+        out["Description"] = [desc_for(out.at[i,"Item ID"], out.at[i,"Description"]) for i in out.index]
+
+        def ritepro_qty_for_row(item_id, parent_id):
+            for pv in key_variants(parent_id):
+                for cv in key_variants(item_id):
+                    q = _EDGE_QTY.get((normalize_id(pv), cv))
+                    if q:
+                        return q
+            for cv in key_variants(item_id):
+                q = _LAST_CHILD_QTY.get(cv, "")
+                if q:
+                    return q
+            return ""
+
+        out["RitePro Qty"] = [ritepro_qty_for_row(out.at[i,"Item ID"], out.at[i,"Parent Item ID"]) for i in out.index]
+
+        def pick_jde_qty_for_id(item_id: str, rp_qty: str) -> str:
+            for v in key_variants(item_id):
+                qs = jde_qty_lists.get(v, []) or []
+                for q in qs:
+                    if qty_equal(q, rp_qty) == "Yes": return q
+                for q in qs:
+                    if str(q).strip() != "": return q
+                if qs: return qs[0]
+            return ""
+
+        out["JDE Quantity"] = [
+            pick_jde_qty_for_id(out.at[i,"JDE Item ID"], out.at[i,"RitePro Qty"])
+            for i in out.index
+        ]
+
+        # -------- recursive explosion for ST in {0,M} (P stops) ----------
+        api_url = _LAST_API_URL
+        exploded_rows = []
+
+        def parse_level_int(s):
+            s = str(s).strip()
+            if s == "": return None
+            try: return int(float(s))
+            except Exception: return None
+
+        def rp_level_for(item_id):
+            return rp_level_map.get(normalize_id(item_id), 0)
+
+        def explode(parent_row_dict, level_num, stack_seen):
+            base = dict(parent_row_dict)
+            base["Level"] = str(level_num)
+
+            parent_item = str(base.get("Item ID", "")).strip()
+            parent_st = str(base.get("Stocking Type", "")).strip().upper()
+            base["Parent Item ID"] = base.get("Parent Item ID", parent_item)
+            base["Parent Stocking Type"] = get_st(base["Parent Item ID"])
+
+            exploded_rows.append(base)
+            if parent_st == "P" or parent_item == "":
+                return
+            if parent_item in stack_seen:
+                return
+            stack_seen.add(parent_item)
+
+            data = get_children_cached_sync(api_url, parent_item)
+
+            if parent_st in {"0", "M"}:
+                for it in data:
+                    ch = it.get("child", {}) or {}
+                    cid = clean(ch.get("item_id"))
+                    if not cid or cid == "None":
+                        continue
+                    rq = qty_normalize(clean(it.get("qty")))
+                    child_row = dict(base)
+                    child_row["Item ID"] = cid
+                    jde_child_id = lookup_variant(jde_canon_map, cid, default="")
+                    child_row["Stocking Type"] = get_st(cid)
+                    child_row["Parent Item ID"] = parent_item
+                    child_row["Parent Stocking Type"] = get_st(parent_item)
+                    child_row["RitePro Qty"] = ritepro_qty_for_row(cid, parent_item) or (rq or "")
+                    child_row["JDE Item ID"] = jde_child_id
+                    child_row["JDE Quantity"] = pick_jde_qty_for_id(jde_child_id or cid, child_row["RitePro Qty"])
+                    child_row["Description"] = desc_for(cid, child_row.get("Description",""))
+                    explode(child_row, level_num + 1, stack_seen.copy())
+
+        for i in out.index:
+            jde_lvl = parse_level_int(out.at[i,"Level"])
+            start_lvl = jde_lvl if jde_lvl is not None else rp_level_for(out.at[i,"Item ID"] or out.at[i,"JDE Item ID"])
+            if start_lvl is None: start_lvl = 0
+            explode(out.loc[i].to_dict(), start_lvl, set())
+
+        out_exploded = pd.DataFrame(exploded_rows).fillna("")
+
+        # ---------- Build API-only edges from LIVE crawl map ----------
+        api_edges = []  # (parent, child, rp_qty, lvl)
+        seen = set()
+        q = deque([(root_model, 0)])
+        while q:
+            p, lvl = q.popleft()
+            if (p, lvl) in seen:
+                continue
+            seen.add((p, lvl))
+            data = get_children_cached_sync(api_url, p)
+            for it in data:
+                ch = it.get("child", {}) or {}
+                cid = clean(ch.get("item_id"))
+                if not cid or cid == "None":
+                    continue
+                rq = qty_normalize(clean(it.get("qty")))
+                api_edges.append((p, cid, rq, lvl + 1))
+                q.append((cid, lvl + 1))
+
+        exploded_pairs = set(zip(
+            out_exploded["Parent Item ID"].astype(str).map(normalize_id),
+            out_exploded["Item ID"].astype(str).map(normalize_id)
+        ))
+
+        api_only_rows = []
+        for parent, child, rq, lvl in api_edges:
+            if (normalize_id(parent), normalize_id(child)) not in _LIVE_EDGES:
+                continue
+            child_in_jde_bool = any(v in jde_canon_map for v in key_variants(child))
+            pkey = (normalize_id(parent), normalize_id(child))
+            if pkey in exploded_pairs:
+                continue
+            if not child_in_jde_bool:
+                desc = ""
+                for v in key_variants(child):
+                    if v in _LAST_CHILD_DESC:
+                        desc = _LAST_CHILD_DESC[v]
+                api_only_rows.append({
+                    "Level": str(lvl),
+                    "Parent Item ID": parent,
+                    "Parent Stocking Type": get_st(parent),
+                    "Item ID": child,
+                    "JDE Item ID": "",
+                    "RitePro Qty": rq or "",
+                    "JDE Quantity": pick_jde_qty_for_id(child, rq or ""),
+                    "Stocking Type": get_st(child),
+                    "Description": desc
+                })
+
+        if api_only_rows:
+            out_exploded = pd.concat([out_exploded, pd.DataFrame(api_only_rows)], ignore_index=True).fillna("")
+
+        # ===== STRICT PARENT ST MATCH TO JDE =====
+        out_exploded["__jde_parent_st"] = out_exploded["Parent Item ID"].astype(str).map(
+            lambda x: (lookup_variant(jde_stock_map, x, default="missing") or "missing").upper()
+        )
+        if "Parent Stocking Type" not in out_exploded.columns:
+            out_exploded["Parent Stocking Type"] = out_exploded["Parent Item ID"].astype(str).map(
+                lambda x: (lookup_variant(jde_stock_map, x, default="missing") or "missing")
+            )
+        out_exploded["Parent Stocking Type"] = out_exploded["Parent Stocking Type"].astype(str).str.upper()
+
+        out_exploded = out_exploded.loc[
+            (out_exploded["__jde_parent_st"] != "MISSING") &
+            (out_exploded["Parent Stocking Type"] == out_exploded["__jde_parent_st"])
+        ].drop(columns=["__jde_parent_st"]).reset_index(drop=True)
+
+        # Keep ONLY rows whose parent→child edge exists in the live crawl
+        out_exploded = out_exploded[
+            out_exploded.apply(
+                lambda r: (normalize_id(str(r.get("Parent Item ID",""))), normalize_id(str(r.get("Item ID","")))) in _LIVE_EDGES,
+                axis=1
+            )
+        ].reset_index(drop=True)
+
+        # Keep only Parent ST in {0, M, P}
+        if "Parent Stocking Type" in out_exploded.columns:
+            out_exploded = out_exploded[
+                out_exploded["Parent Stocking Type"].isin({"0", "M", "P"})
+            ].reset_index(drop=True)
+
+        out_exploded["Qty Match"] = [
+            qty_equal(out_exploded.at[i, "RitePro Qty"], out_exploded.at[i, "JDE Quantity"])
+            for i in out_exploded.index
+        ]
+
+        child_in_jde = out_exploded["Item ID"].apply(lambda x: any(v in jde_canon_map for v in key_variants(x)))
+        rp_only = ~child_in_jde
+        st_ok = out_exploded["Stocking Type"].astype(str).str.strip().str.upper().isin({"P", "M", "0"}) if "Stocking Type" in out_exploded.columns else True
+        mismatch = out_exploded["Qty Match"].astype(str).str.upper().eq("NO")
+        not_ar   = out_exploded["RitePro Qty"].astype(str).str.upper().ne("AR")
+
+        keep_mask = ((child_in_jde & st_ok & mismatch & not_ar) | (rp_only & not_ar))
+        filtered_multi = out_exploded.loc[keep_mask].copy()
+
+        filtered_multi = filtered_multi.rename(columns={
+            "Item ID": "RitePro Item ID",
+            "RitePro Qty": "RitePro Item ID Qty",
+            "JDE Quantity": "JDE Item ID Qty",
+            "Stocking Type": "RitePro JDE ST",
+            "Qty Match": "Qty Match (Y/N)",
+        })
+
+        final_cols_multi = [
+            "Level","Parent Item ID","Parent Stocking Type",
+            "RitePro Item ID","JDE Item ID","RitePro Item ID Qty","JDE Item ID Qty",
+            "Qty Match (Y/N)","RitePro JDE ST","Description",
+        ]
+        for c in final_cols_multi:
+            if c not in filtered_multi.columns:
+                filtered_multi[c] = ""
+        final_view_multi = (filtered_multi
+                            .reindex(columns=final_cols_multi)
+                            .reset_index(drop=True))
+
+        # --------- DEDUPE *only within the same Level* (keep different Levels) ----------
+        def _norm(s):
+            s = "" if s is None else str(s).strip()
+            return normalize_id(s)
+        _tmp = final_view_multi.copy()
+        _tmp["_L"]  = _tmp["Level"].astype(str).str.strip()
+        _tmp["_PI"] = _tmp["Parent Item ID"].map(_norm)
+        _tmp["_RI"] = _tmp["RitePro Item ID"].map(_norm)
+        # drop duplicates with same Level + Parent + RitePro child
+        _tmp = _tmp.drop_duplicates(subset=["_L","_PI","_RI"], keep="first")
+        final_view_multi = _tmp.drop(columns=["_L","_PI","_RI"]).reset_index(drop=True)
+        # ---------------------------------------------------------------------------------
+
+        # ---------- SINGLE-LEVEL (unchanged; no dedupe here) ----------
+        data_l1 = get_children_cached_sync(_LAST_API_URL, root_model)
+        rp_l1 = []
+        for it in data_l1:
+            ch = it.get("child", {}) or {}
+            cid = clean(ch.get("item_id"))
+            if not cid or cid == "None":
+                continue
+            rq = qty_normalize(clean(it.get("qty"))); rp_l1.append((cid, rq))
+
+        def get_st2(item_id):
+            return lookup_variant(jde_stock_map, item_id, default="missing")
+
+        parent_st_for_root = get_st2(root_model)
+        single_rows = []
+        for cid, rp_qty in rp_l1:
+            if (normalize_id(root_model), normalize_id(cid)) not in _LIVE_EDGES:
+                continue
+            in_jde_bool = any(v in jde_canon_map for v in key_variants(cid))
+            jde_child_id = lookup_variant(jde_canon_map, cid, default="")
+            jde_qty = pick_jde_qty_for_id(jde_child_id or cid, rp_qty)
+            st_child = get_st2(cid)
+            desc = ""
+            for v in key_variants(cid):
+                if v in _LAST_CHILD_DESC:
+                    desc = _LAST_CHILD_DESC[v]
+            row = {
+                "Level": "1",
+                "Parent Item ID": root_model,
+                "Parent Stocking Type": parent_st_for_root,
+                "RitePro Item ID": cid,
+                "JDE Item ID": jde_child_id,
+                "RitePro Item ID Qty": rp_qty or "",
+                "JDE Item ID Qty": jde_qty or "",
+                "RitePro JDE ST": st_child,
+                "Description": desc,
+            }
+            row["Qty Match (Y/N)"] = qty_equal(row["RitePro Item ID Qty"], row["JDE Item ID Qty"])
+            single_rows.append((in_jde_bool, row))
+
+        single_kept = []
+        for in_jde_bool, row in single_rows:
+            st_ok_s = str(row.get("RitePro JDE ST","")).upper() in {"P", "M", "0"}
+            mismatch_s = str(row["Qty Match (Y/N)"]).upper() == "NO"
+            not_ar_s = str(row["RitePro Item ID Qty"]).upper() != "AR"
+            if (in_jde_bool and st_ok_s and mismatch_s and not_ar_s) or ((not in_jde_bool) and not_ar_s):
+                single_kept.append(row)
+
+        final_cols_single = [
+            "Level","Parent Item ID","Parent Stocking Type","RitePro Item ID","JDE Item ID",
+            "RitePro Item ID Qty","JDE Item ID Qty","Qty Match (Y/N)","RitePro JDE ST","Description"
+        ]
+        final_view_single = pd.DataFrame(single_kept).fillna("")
+        if final_view_single.empty:
+            final_view_single = pd.DataFrame(columns=final_cols_single)
+        else:
+            for c in final_cols_single:
+                if c not in final_view_single.columns:
+                    final_view_single[c] = ""
+            final_view_single = final_view_single.reindex(columns=final_cols_single)
+
+        # ===== fill blanks with your exact "Missing ..." labels (both sheets) =====
+        MISSING_MAP = {
+            "Parent Item ID":       "Missing in RitePro",
+            "Parent Stocking Type": "Missing in JDE",
+            "RitePro Item ID":      "Missing in RitePro",
+            "JDE Item ID":          "Missing in JDE",
+            "RitePro Item ID Qty":  "Missing in RitePro",
+            "JDE Item ID Qty":      "Missing in JDE",
+            "RitePro JDE ST":       "Missing",
+        }
+        def _apply_missing(df):
+            import pandas as pd
+            for col, label in MISSING_MAP.items():
+                if col in df.columns:
+                    df[col] = df[col].apply(lambda x: label if (pd.isna(x) or str(x).strip()=="") else x)
+            return df
+
+        final_view_multi  = _apply_missing(final_view_multi)
+        final_view_single = _apply_missing(final_view_single)
+
+        with pd.ExcelWriter(final_path_multi) as w:
+            final_view_multi.to_excel(w, index=False, sheet_name="Results")
+        with pd.ExcelWriter(final_path_single) as w:
+            final_view_single.to_excel(w, index=False, sheet_name="L1 Results")
+
+        prev_single = final_view_single.head(100)
+        prev_multi  = final_view_multi.head(100)
+        return (final_path_single, prev_single, final_path_multi,  prev_multi)
+
+    except Exception as e:
+        print("Error in compare_and_generate_excel:", e)
+        import pandas as pd
+        with pd.ExcelWriter(final_path_multi) as w:
+            pd.DataFrame().to_excel(w, index=False, sheet_name="Results")
+        with pd.ExcelWriter(final_path_single) as w:
+            pd.DataFrame().to_excel(w, index=False, sheet_name="L1 Results")
+        return (final_path_single, pd.DataFrame([{"Error": str(e)}]),
+                final_path_multi,  pd.DataFrame([{"Error": str(e)}]))
+
+def full_process(api_src, model_number, jde_file):
+    status_msg, df_preview, bom_path, root_model = extract_bom(api_src, model_number)
+    jde_df = load_jde_excel(jde_file)
+    config_tag = safe_tag(model_number)
+    single_path, single_preview, multi_path, multi_preview = compare_and_generate_excel(df_preview, jde_df, config_tag, root_model)
+    return (status_msg, df_preview, bom_path, jde_df,
+            single_preview, single_path,
+            multi_preview,  multi_path)
+
+# ---------- UI ----------
+css = """
+h1 { background-color: darkred !important; color: white !important; font-weight: bold !important;
+     padding: 10px !important; text-align: center !important; border-radius: 6px !important; }
+a[href$='.xlsx'] { background-color: orange !important; color: white !important; font-weight: bold !important;
+     padding: 10px 16px !important; border-radius: 6px !important; text-align: right !important;
+     display: block !important; margin-left: auto !important; }
+label:has(input[type="file"]), label:has(.gr-file) { color: darkred !important; font-weight: bold !important; }
+/* Hide Gradio status text/timer */
+*[data-testid="status"], .gr-status, .wrap .text-sm { display: none !important; }
+"""
+
+iface = gr.Interface(
+    fn=full_process,
+    inputs=[
+        gr.Dropdown(choices=list(API_URLS.keys()), label="Product Line Source", value="medical"),
+        gr.Textbox(label="Product Configuration ID", placeholder="e.g. TL05KO-A1-4719"),
+        gr.File(label="Upload of JDE Excel", file_types=[".xlsx"])
+    ],
+    outputs=[
+        gr.Text(label="BOM Load Summary"),
+        gr.Dataframe(label="BOM Data (Preview 200 rows)"),
+        gr.File(label="Download RitePro BOM Results"),
+        gr.Dataframe(label="Preview of JDE Excel"),
+        gr.Dataframe(label="Preview – Single-Level (L1)"),
+        gr.File(label="Download Single-Level Results"),
+        gr.Dataframe(label="Preview – Multi-Level"),
+        gr.File(label="Download Multi-Level Results")
+    ],
+    title="BOMBridge – Multilevel BOM Validation & Analysis Dashboard",
+    theme="default",
+    css=css,
+    allow_flagging="never",
+    analytics_enabled=False,
+    show_api=False,
+    show_progress="full"   # hide ETA/progress
+)
+
+# Disable Gradio queue (prevents ETA/queue timing behavior)
+iface.launch(inbrowser=True, share=False)
 
